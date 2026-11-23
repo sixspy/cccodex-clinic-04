@@ -6,6 +6,11 @@ from pathlib import Path
 
 from app.config import Config
 
+# 分片上限旁路账册的固定键与出厂值。
+SHARD_CAP_KEY = "backfill_shard_cap"
+DEFAULT_SHARD_CAP = 5
+DEFAULT_SHARD_CONCURRENCY = 1
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS trial_sites (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,10 +76,21 @@ CREATE TABLE IF NOT EXISTS backfill_jobs (
   row_id INTEGER NOT NULL REFERENCES visit_rows(id),
   status TEXT NOT NULL CHECK (status IN ('排队','执行中','成功','失败')),
   attempt INTEGER NOT NULL DEFAULT 1,
+  shard_no INTEGER NOT NULL DEFAULT 0,
   message TEXT NOT NULL DEFAULT '',
   started_at TEXT,
   finished_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS shard_cap_ledger (
+  cap_key TEXT PRIMARY KEY,
+  shard_cap INTEGER NOT NULL,
+  shard_concurrency INTEGER NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1,
+  fingerprint TEXT NOT NULL,
+  updated_by TEXT NOT NULL DEFAULT 'admin',
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS reconcile_reports (
@@ -110,12 +126,30 @@ CREATE TABLE IF NOT EXISTS meta (
 """
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """为既有库补列；新建库由 SCHEMA 直接建全。"""
+    job_cols = {r["name"] for r in conn.execute("PRAGMA table_info(backfill_jobs)")}
+    if "shard_no" not in job_cols:
+        conn.execute(
+            "ALTER TABLE backfill_jobs ADD COLUMN shard_no INTEGER NOT NULL DEFAULT 0"
+        )
+    # 存量在册任务补分片号，纳入上限口径，避免升级后凭空超额。
+    conn.execute(
+        """
+        UPDATE backfill_jobs SET shard_no=1
+        WHERE shard_no < 1 AND status IN ('排队','执行中')
+        """
+    )
+
+
 def ensure_db() -> Path:
     Config.INSTANCE_DIR.mkdir(parents=True, exist_ok=True)
     path = Config.DATABASE_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
         conn.executescript(SCHEMA)
+        _migrate(conn)
         conn.commit()
     return path
 
@@ -124,7 +158,7 @@ def ensure_db() -> Path:
 def get_db(db_path: str | Path | None = None):
     path = Path(db_path) if db_path else Config.DATABASE_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=10.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     try:

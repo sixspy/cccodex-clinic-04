@@ -15,6 +15,7 @@ from app.services import protocols as protocols_svc
 from app.services import qc as qc_svc
 from app.services import reconcile as reconcile_svc
 from app.services import settings as settings_svc
+from app.services import shard_cap as shard_cap_svc
 from app.services import sites as sites_svc
 from app.services import visits as visits_svc
 from app.services.errors import ServiceError
@@ -415,10 +416,41 @@ class Api:
         if action == "run" and method == "POST":
             return _json(reconcile_svc.run_reconcile())
         if action == "matrix" and method == "GET":
-            return _json({"items": reconcile_svc.site_gap_matrix()})
+            return _json(reconcile_svc.matrix_view())
         if action is None and method == "GET":
             return _json({"items": reconcile_svc.list_reports()})
         return _json({"error": "未知对账路由"}, 404)
+
+    @cherrypy.expose
+    @_wrap
+    def shard_cap(self, action=None):
+        _require()
+        method = cherrypy.request.method
+        if action is None and method == "GET":
+            return _json(
+                {
+                    "cap": shard_cap_svc.read_cap(),
+                    "landing": shard_cap_svc.landing_status(),
+                    "criterion": shard_cap_svc.cap_criterion(),
+                }
+            )
+        if action == "write" and method == "POST":
+            body = _read_json()
+            return _json(
+                shard_cap_svc.write_cap(
+                    body.get("cap_key") or shard_cap_svc.CAP_KEY,
+                    body.get("shard_cap"),
+                    body.get("shard_concurrency"),
+                    expected_version=body.get("expected_version"),
+                )
+            )
+        return _json({"error": "未知分片上限路由"}, 404)
+
+    @cherrypy.expose
+    @_wrap
+    def shard_summary(self):
+        _require()
+        return _json(shard_cap_svc.shard_summary())
 
     @cherrypy.expose
     @_wrap
@@ -519,6 +551,13 @@ class ApiMount:
             if len(parts) == 1:
                 return api.settings()
             return api.settings(action=parts[1])
+        if path == "/shard-cap" or path.startswith("/shard-cap/"):
+            parts = path.strip("/").split("/")
+            if len(parts) == 1:
+                return api.shard_cap()
+            return api.shard_cap(action=parts[1])
+        if path == "/shard-summary":
+            return api.shard_summary()
         if path == "/audits" or path.startswith("/audits"):
             return api.audits()
         return _json({"error": f"未知接口 {path}"}, 404)

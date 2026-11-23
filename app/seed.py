@@ -3,11 +3,16 @@ from __future__ import annotations
 import json
 
 from app.db import _meta_get, _meta_set, ensure_db, get_db
+from app.services import shard_cap
 
 
 def seed_if_needed(db_path: str | None = None) -> None:
     ensure_db()
     with get_db(db_path) as conn:
+        # 分片上限落点：无论是否首启，业务库里都补齐旁路账册的落点行。
+        shard_cap.ensure_ledger(conn)
+        # 台参数不得承载可写上限值，历史诱饵键一律清掉。
+        conn.execute("DELETE FROM app_settings WHERE key='backfill_shard_cap'")
         if _meta_get(conn, "seeded") == "1":
             return
 
@@ -182,15 +187,17 @@ def seed_if_needed(db_path: str | None = None) -> None:
 
         conn.execute(
             """
-            INSERT INTO backfill_jobs(job_code, row_id, status, attempt, message)
-            VALUES ('BF-0001', ?, '排队', 1, '种子样例排队任务')
+            INSERT INTO backfill_jobs(job_code, row_id, status, attempt, shard_no, message)
+            VALUES ('BF-0001', ?, '排队', 1, 1, '种子样例排队任务')
             """,
             (row_ids[1],),
         )
         conn.execute(
             """
-            INSERT INTO backfill_jobs(job_code, row_id, status, attempt, message, finished_at)
-            VALUES ('BF-0002', ?, '失败', 2, '种子样例失败任务', datetime('now'))
+            INSERT INTO backfill_jobs(
+              job_code, row_id, status, attempt, shard_no, message, finished_at
+            )
+            VALUES ('BF-0002', ?, '失败', 2, 1, '种子样例失败任务', datetime('now'))
             """,
             (row_ids[2],),
         )

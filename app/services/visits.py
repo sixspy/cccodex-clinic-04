@@ -7,6 +7,7 @@ from datetime import datetime
 from app.db import get_db
 from app.services import audit as audit_svc
 from app.services import protocols as protocols_svc
+from app.services import shard_cap as shard_cap_svc
 from app.services.errors import ServiceError
 
 BATCH_STATUS = ("采集中", "已收齐", "已关闭")
@@ -47,11 +48,21 @@ def list_batches(
         clauses.append("b.status=?")
         params.append(status)
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    cap = shard_cap_svc.read_cap(db_path=db_path)
     with get_db(db_path) as conn:
         rows = conn.execute(
             f"""
             SELECT b.*, s.name AS site_name, s.site_code,
-                   p.protocol_code, p.version AS protocol_version
+                   p.protocol_code, p.version AS protocol_version,
+                   (SELECT COUNT(*) FROM backfill_jobs j
+                      JOIN visit_rows r ON r.id=j.row_id
+                     WHERE r.batch_id=b.id AND j.status IN ('排队','执行中'))
+                     AS active_jobs,
+                   (SELECT COUNT(DISTINCT j.shard_no) FROM backfill_jobs j
+                      JOIN visit_rows r ON r.id=j.row_id
+                     WHERE r.batch_id=b.id AND j.status IN ('排队','执行中')
+                       AND j.shard_no >= 1)
+                     AS active_shards
             FROM visit_batches b
             JOIN trial_sites s ON s.id=b.site_id
             LEFT JOIN protocols p ON p.id=b.protocol_id
@@ -60,10 +71,17 @@ def list_batches(
             """,
             params,
         ).fetchall()
-        return [dict(r) for r in rows]
+        items = []
+        for r in rows:
+            item = dict(r)
+            item["shard_cap"] = int(cap["shard_cap"])
+            item["shard_concurrency"] = int(cap["shard_concurrency"])
+            items.append(item)
+        return items
 
 
 def get_batch(batch_id: int, db_path: str | None = None) -> dict:
+    cap = shard_cap_svc.read_cap(db_path=db_path)
     with get_db(db_path) as conn:
         row = conn.execute(
             """
@@ -97,6 +115,21 @@ def get_batch(batch_id: int, db_path: str | None = None) -> dict:
         data = dict(row)
         data["items"] = [dict(i) for i in items]
         data["quality_stats"] = {r["quality"]: r["c"] for r in quality_stats}
+        active = conn.execute(
+            """
+            SELECT COUNT(*) AS active_jobs,
+                   COUNT(DISTINCT CASE WHEN j.shard_no >= 1 THEN j.shard_no END)
+                     AS active_shards
+            FROM backfill_jobs j
+            JOIN visit_rows r ON r.id=j.row_id
+            WHERE r.batch_id=? AND j.status IN ('排队','执行中')
+            """,
+            (batch_id,),
+        ).fetchone()
+        data["shard_cap"] = int(cap["shard_cap"])
+        data["shard_concurrency"] = int(cap["shard_concurrency"])
+        data["active_jobs"] = int(active["active_jobs"])
+        data["active_shards"] = int(active["active_shards"])
         return data
 
 

@@ -7,6 +7,8 @@ export async function renderReconcile(el) {
     api('/api/reports/matrix'),
     api('/api/audits?limit=30'),
   ]);
+  const shard = matrix.shard || {};
+  const shardLanded = shard.landed && shard.fingerprint_ok;
 
   el.innerHTML = `
     <div class="card">
@@ -25,10 +27,21 @@ export async function renderReconcile(el) {
       <div id="latest" class="detail-box">尚未生成本次对账。</div>
     </div>
     <div class="card">
+      <h2>分片摘要</h2>
+      <p class="muted">与缺口补采页同口径：分片上限钉在旁路账册，一处改全站读到；对账矩阵按同一口径展示。</p>
+      <div class="row">
+        <span class="chip ${shardLanded ? 'ok' : 'bad'}">上限徽标 · 分片上限 ${shard.shard_cap ?? '-'}</span>
+        <span class="chip ok">分片并发数 ${shard.shard_concurrency ?? '-'}</span>
+        <span class="chip ${shardLanded ? 'ok' : 'bad'}">落点 ${shardLanded ? '已落库' : '未落库/指纹不符'}</span>
+        <span class="chip idle">来源 ${escapeHtml(shard.source || '-')}</span>
+        <span class="chip idle">在用分片 ${(shard.totals && shard.totals.active_shards) ?? '-'} · 在册任务 ${(shard.totals && shard.totals.active_jobs) ?? '-'}</span>
+      </div>
+    </div>
+    <div class="card">
       <h2>中心缺口矩阵</h2>
       <table>
         <thead>
-          <tr><th>中心</th><th>状态</th><th>批次</th><th>访视行</th><th>缺口</th><th>开放发现</th></tr>
+          <tr><th>中心</th><th>状态</th><th>批次</th><th>访视行</th><th>缺口</th><th>开放发现</th><th>分片并发数</th><th>在用分片</th></tr>
         </thead>
         <tbody>
           ${(matrix.items || []).map((s) => `
@@ -39,6 +52,8 @@ export async function renderReconcile(el) {
               <td>${s.row_count}</td>
               <td>${s.gap_count || 0}</td>
               <td>${s.open_findings || 0}</td>
+              <td><span class="chip idle">并发 ${s.shard_concurrency ?? '-'}</span></td>
+              <td>${s.active_shards || 0} / ${s.shard_concurrency || '-'}</td>
             </tr>`).join('')}
         </tbody>
       </table>
@@ -88,6 +103,14 @@ export async function renderReconcile(el) {
         开放发现: r.open_findings,
         待执行补采: r.pending_jobs,
         不一致分: r.mismatch,
+        分片: r.detail && r.detail.shard
+          ? {
+              上限: r.detail.shard.shard_cap,
+              并发数: r.detail.shard.shard_concurrency,
+              来源: r.detail.shard.source,
+              在用分片: r.detail.shard.totals.active_shards,
+            }
+          : null,
         明细: r.detail,
       }, null, 2);
       const reports2 = await api('/api/reports');

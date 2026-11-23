@@ -1,9 +1,14 @@
 import { api, escapeHtml } from '../api.js';
 
 export async function renderSettings(el) {
-  const data = await api('/api/settings');
+  const [data, shard] = await Promise.all([
+    api('/api/settings'),
+    api('/api/shard-cap'),
+  ]);
   const items = data.items || [];
   const snapshot = data.snapshot || {};
+  const criterion = shard.criterion || {};
+  const cap = shard.cap || {};
 
   el.innerHTML = `
     <div class="card">
@@ -15,6 +20,20 @@ export async function renderSettings(el) {
         <div class="stat"><div class="n">${snapshot.site_quota_warn || '-'}</div><div class="l">配额告警阈值</div></div>
         <div class="stat"><div class="n">${escapeHtml((snapshot.clinic_timezone || '-').slice(0, 12))}</div><div class="l">时区</div></div>
       </div>
+    </div>
+    <div class="card">
+      <h2>分片上限口径</h2>
+      <p class="muted">台参数只展口径，不承载可写上限值。分片上限钉在旁路账册，读侧只认账册、不回刷台参数；写入口在缺口补采页的分片上限闸。</p>
+      <div class="row">
+        <span class="chip ${criterion.landed ? 'ok' : 'bad'}">上限徽标 · 分片上限 ${cap.shard_cap ?? '-'}</span>
+        <span class="chip ok">分片并发数 ${cap.shard_concurrency ?? '-'}</span>
+        <span class="chip ${criterion.fingerprint_ok ? 'ok' : 'bad'}">字段指纹 ${criterion.fingerprint_ok ? '对齐' : '对不上'}</span>
+        <span class="chip idle">来源 ${escapeHtml(criterion.source || '-')}</span>
+        <span class="chip idle">账册表 ${escapeHtml(criterion.table || '-')}</span>
+        <span class="chip idle">业务键 ${escapeHtml(criterion.cap_key || '-')}</span>
+        <span class="chip idle">v${cap.version ?? '-'}</span>
+      </div>
+      <p class="muted">写入口：${escapeHtml(criterion.writable_via || '-')}。台参数更新接口不接收分片上限键。</p>
     </div>
     <div class="card">
       <table>
@@ -37,7 +56,6 @@ export async function renderSettings(el) {
       <ul class="muted">
         <li>访视行跨中心去重策略与冲突裁决面板</li>
         <li>方案换版后存量批次字段兼容扫描</li>
-        <li>补采任务分片与并发上限</li>
         <li>对账报告导出与差异工单</li>
       </ul>
       <div class="detail-box">${escapeHtml(JSON.stringify(snapshot, null, 2))}</div>

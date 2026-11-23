@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from app.db import get_db
 from app.services import audit as audit_svc
+from app.services import shard_cap as shard_cap_svc
 from app.services.errors import ServiceError
 
 
@@ -50,6 +51,7 @@ def dashboard(db_path: str | None = None) -> dict:
 
 
 def run_reconcile(db_path: str | None = None) -> dict:
+    shard = shard_cap_svc.shard_summary(db_path=db_path)
     with get_db(db_path) as conn:
         gap_rows = conn.execute(
             """
@@ -99,7 +101,8 @@ def run_reconcile(db_path: str | None = None) -> dict:
         mismatch = orphan_gaps + stale_findings + uncovered
         summary = (
             f"缺口行{gap_rows} · 开放发现{open_findings} · 待执行补采{pending_jobs} · "
-            f"无发现缺口{orphan_gaps} · 陈旧发现{stale_findings} · 未覆盖补采{uncovered}"
+            f"无发现缺口{orphan_gaps} · 陈旧发现{stale_findings} · 未覆盖补采{uncovered} · "
+            f"分片{shard['shard_cap']}×{shard['shard_concurrency']}"
         )
         cur = conn.execute(
             """
@@ -136,6 +139,7 @@ def run_reconcile(db_path: str | None = None) -> dict:
                     """
                 ).fetchall()
             ],
+            "shard": shard,
         }
     audit_svc.write_event(
         "访视对账", "reconcile_report", rid, summary, db_path=db_path
@@ -187,3 +191,31 @@ def site_gap_matrix(db_path: str | None = None) -> list[dict]:
             """
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def matrix_view(db_path: str | None = None) -> dict:
+    """对账矩阵一屏：中心缺口口径 + 分片摘要（上限 / 并发 / 在用分片）。"""
+    items = site_gap_matrix(db_path=db_path)
+    shard = shard_cap_svc.shard_summary(db_path=db_path)
+    with get_db(db_path) as conn:
+        per_site = conn.execute(
+            """
+            SELECT b.site_id,
+                   COUNT(j.id) AS active_jobs,
+                   COUNT(DISTINCT CASE WHEN j.shard_no >= 1 THEN j.shard_no END)
+                     AS active_shards
+            FROM backfill_jobs j
+            JOIN visit_rows r ON r.id=j.row_id
+            JOIN visit_batches b ON b.id=r.batch_id
+            WHERE j.status IN ('排队','执行中')
+            GROUP BY b.site_id
+            """
+        ).fetchall()
+    site_shards = {int(r["site_id"]): r for r in per_site}
+    for item in items:
+        s = site_shards.get(int(item["id"]))
+        item["shard_cap"] = shard["shard_cap"]
+        item["shard_concurrency"] = shard["shard_concurrency"]
+        item["active_shards"] = int(s["active_shards"]) if s else 0
+        item["active_jobs"] = int(s["active_jobs"]) if s else 0
+    return {"items": items, "shard": shard}

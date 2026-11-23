@@ -4,6 +4,9 @@ from app.db import get_db
 from app.services import audit as audit_svc
 from app.services.errors import ServiceError
 
+# 台参数只展分片上限口径：上限值本身钉在旁路账册，不在这里可写。
+SHARD_CAP_KEYS = ("backfill_shard_cap", "backfill_shard_concurrency")
+
 
 def list_settings(db_path: str | None = None) -> list[dict]:
     with get_db(db_path) as conn:
@@ -30,6 +33,8 @@ def update_setting(key: str, value: str, db_path: str | None = None) -> dict:
     key = (key or "").strip()
     if not key:
         raise ServiceError("设置键不能空")
+    if key in SHARD_CAP_KEYS:
+        raise ServiceError("分片上限不走台参数；请在分片上限闸写入旁路账册")
     value = "" if value is None else str(value).strip()
     if len(value) > 200:
         raise ServiceError("设置值过长")

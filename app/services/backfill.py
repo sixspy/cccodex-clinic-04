@@ -6,6 +6,7 @@ from datetime import datetime
 from app.db import get_db
 from app.services import audit as audit_svc
 from app.services import settings as settings_svc
+from app.services import shard_cap as shard_cap_svc
 from app.services.errors import ServiceError
 
 JOB_STATUS = ("排队", "执行中", "成功", "失败")
@@ -68,7 +69,11 @@ def enqueue_from_row(row_id: int, db_path: str | None = None) -> dict:
     row_id = int(row_id or 0)
     if row_id <= 0:
         raise ServiceError("必须指定访视行")
+    # 补采闸：账册未落库 / 指纹对不上 / 上限非法都在这里一次拦住。
+    cap = shard_cap_svc.read_cap(db_path=db_path, strict=True)
     with get_db(db_path) as conn:
+        # 抢分片位要串行：先拿写锁，再数在册任务，避免两名值班同时越过上限。
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute("SELECT * FROM visit_rows WHERE id=?", (row_id,)).fetchone()
         if not row:
             raise ServiceError("访视行不存在", 404)
@@ -88,14 +93,26 @@ def enqueue_from_row(row_id: int, db_path: str | None = None) -> dict:
         ).fetchone()
         if pending:
             raise ServiceError("该行已有进行中的补采任务")
+        # 失败任务只能走「重试排队」，否则每次再点排队都会新增一条，
+        # 分片打满后彼此踩踏重试把队列拖进死循环。
+        failed = conn.execute(
+            """
+            SELECT id FROM backfill_jobs
+            WHERE row_id=? AND status='失败'
+            """,
+            (row_id,),
+        ).fetchone()
+        if failed:
+            raise ServiceError("该行已有失败任务，请走失败任务的重试排队")
+        shard_no = shard_cap_svc.pick_shard(conn, cap)
         n = conn.execute("SELECT COUNT(*) AS c FROM backfill_jobs").fetchone()["c"] + 1
         code = f"BF-{n:04d}"
         cur = conn.execute(
             """
-            INSERT INTO backfill_jobs(job_code, row_id, status, attempt, message)
-            VALUES (?, ?, '排队', 1, '等待执行')
+            INSERT INTO backfill_jobs(job_code, row_id, status, attempt, shard_no, message)
+            VALUES (?, ?, '排队', 1, ?, ?)
             """,
-            (code, row_id),
+            (code, row_id, shard_no, f"等待执行 · 分片 {shard_no}"),
         )
         job_id = cur.lastrowid
         if row["status"] in ("待检", "已入库"):
@@ -103,7 +120,11 @@ def enqueue_from_row(row_id: int, db_path: str | None = None) -> dict:
                 "UPDATE visit_rows SET status='待补采' WHERE id=?", (row_id,)
             )
     audit_svc.write_event(
-        "排队补采", "backfill_job", job_id, f"row={row_id}", db_path=db_path
+        "排队补采",
+        "backfill_job",
+        job_id,
+        f"row={row_id} shard={shard_no}",
+        db_path=db_path,
     )
     return get_job(job_id, db_path)
 
@@ -120,11 +141,17 @@ def enqueue_gaps_for_batch(batch_id: int, db_path: str | None = None) -> dict:
         ).fetchall()
     jobs = []
     skipped = 0
+    first_error = ""
     for r in rows:
         try:
             jobs.append(enqueue_from_row(r["id"], db_path=db_path))
-        except ServiceError:
+        except ServiceError as exc:
             skipped += 1
+            if not first_error:
+                first_error = exc.message
+    if not jobs and first_error:
+        # 一条都没排上时必须说人话，不能静默吞掉超额/账册拦截。
+        raise ServiceError(first_error)
     audit_svc.write_event(
         "批量排队补采",
         "visit_batch",
@@ -253,7 +280,9 @@ def run_job(job_id: int, succeed: bool = True, db_path: str | None = None) -> di
 
 
 def retry_job(job_id: int, db_path: str | None = None) -> dict:
+    cap = shard_cap_svc.read_cap(db_path=db_path, strict=True)
     with get_db(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
         job = conn.execute(
             "SELECT * FROM backfill_jobs WHERE id=?", (job_id,)
         ).fetchone()
@@ -264,16 +293,20 @@ def retry_job(job_id: int, db_path: str | None = None) -> dict:
         max_attempt = settings_svc.get_int("backfill_max_attempt", 3, db_path=db_path)
         if job["attempt"] >= max_attempt:
             raise ServiceError("已达最大尝试次数，不能重试")
+        # 重新排队同样要占分片位并受上限约束，不能绕过补采闸。
+        shard_no = shard_cap_svc.pick_shard(conn, cap)
         conn.execute(
             """
             UPDATE backfill_jobs
-            SET status='排队', message='失败后重新排队',
+            SET status='排队', shard_no=?, message=?,
                 started_at=NULL, finished_at=NULL
             WHERE id=?
             """,
-            (job_id,),
+            (shard_no, f"失败后重新排队 · 分片 {shard_no}", job_id),
         )
-    audit_svc.write_event("重试补采", "backfill_job", job_id, "", db_path=db_path)
+    audit_svc.write_event(
+        "重试补采", "backfill_job", job_id, f"shard={shard_no}", db_path=db_path
+    )
     return get_job(job_id, db_path)
 
 

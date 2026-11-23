@@ -39,7 +39,7 @@ export async function renderVisits(el) {
         <thead>
           <tr>
             <th>批次编码</th><th>中心</th><th>方案</th><th>状态</th>
-            <th>行数</th><th>缺口</th><th>备注</th><th>操作</th>
+            <th>行数</th><th>缺口</th><th>分片并发数</th><th>在用分片</th><th>备注</th><th>操作</th>
           </tr>
         </thead>
         <tbody id="batchBody">
@@ -61,6 +61,8 @@ export async function renderVisits(el) {
         <td>${chip(b.status)}</td>
         <td>${b.item_count}</td>
         <td>${b.gap_count}</td>
+        <td><span class="chip idle">并发 ${b.shard_concurrency || '-'}</span></td>
+        <td>${b.active_shards || 0} / ${b.shard_concurrency || '-'}</td>
         <td class="muted">${escapeHtml(b.note || '')}</td>
         <td class="row">
           <button data-view="${b.id}" class="ghost">查看</button>
@@ -89,6 +91,11 @@ export async function renderVisits(el) {
         <div class="stat"><div class="n">${b.gap_count}</div><div class="l">缺口行</div></div>
         <div class="stat"><div class="n">${qs['合格'] || 0}</div><div class="l">合格</div></div>
         <div class="stat"><div class="n">${(qs['缺字段'] || 0) + (qs['编码空'] || 0) + (qs['重复键'] || 0)}</div><div class="l">异常质量</div></div>
+      </div>
+      <div class="row">
+        <span class="chip ok">分片上限 ${b.shard_cap}</span>
+        <span class="chip ok">分片并发数 ${b.shard_concurrency}</span>
+        <span class="chip idle">在用分片 ${b.active_shards || 0} · 在册任务 ${b.active_jobs || 0}</span>
       </div>
       <div class="row">
         <input id="subjectKey" placeholder="受试者键" />
